@@ -70,15 +70,23 @@ Visual topology with containers for VNets, nested subnets, and connected resourc
 
 ## Future Enhancements
 
-- [ ] Include Load Balancers and Application Gateways (with backend pools, rules)
-- [ ] Add NSG rules as edge labels on subnet connections
-- [ ] Detect orphaned/unused public IPs (cost savings)
-- [ ] Include Azure Firewall and Route Tables
+### v1.2 (Planned)
 - [ ] Query Azure Resource Graph for faster enumeration (large tenants)
+- [ ] Include Load Balancers and Application Gateways (with backend pools, rules)
+- [ ] Include Azure Firewall and Route Tables
 - [ ] Add Azure Bastion hosts
 - [ ] Show VPN Gateways / ExpressRoute circuits
-- [ ] Highlight overlapping IP ranges across VNets
+
+### v1.1 (In Progress)
+- [x] Batched queries (single Get-AzNetworkInterface call per subscription) — huge speedup
+- [x] Detect orphaned/unused public IPs (cost savings)
+- [x] Add NSG names as edge labels on subnet→NIC connections
+- [x] Embedded Legend page inside Draw.IO file
+- [x] Minimal Az modules (Accounts + Network only)
+
+Later:
 - [ ] Export to HTML interactive report
+- [ ] Highlight overlapping IP ranges across VNets
 - [ ] Support for Private Endpoints and Private DNS Zones
 - [ ] Include Application Security Groups (ASGs)
 - [ ] Integrate with Azure Policy to show non-compliant resources

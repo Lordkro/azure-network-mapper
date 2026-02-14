@@ -6,9 +6,24 @@
 [CmdletBinding()]
 param()
 
-# Ensure Az module is installed
-if (-not (Get-Module -ListAvailable -Name Az)) {
-    Write-Error "Az PowerShell module is not installed. Run: Install-Module -Name Az -Scope CurrentUser -Repository PSGallery -Force"
+[CmdletBinding()]
+param(
+    [switch]$UseResourceGraph
+)
+
+# Ensure required Az modules are installed
+$requiredModules = @('Az.Accounts', 'Az.Network')
+if ($UseResourceGraph) {
+    $requiredModules += 'Az.ResourceGraph'
+}
+$missingModules = @()
+foreach ($mod in $requiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $mod)) {
+        $missingModules += $mod
+    }
+}
+if ($missingModules.Count -gt 0) {
+    Write-Error "Required Az modules missing: $($missingModules -join ', '). Run:`nInstall-Module -Name $($missingModules -join ', ') -Scope CurrentUser -Repository PSGallery -Force"
     exit 1
 }
 
@@ -27,6 +42,8 @@ Write-Host "Found $($subscriptions.Count) subscriptions" -ForegroundColor Green
 $allResources = @()
 $diagramNodes = @()
 $diagramEdges = @()
+$recordedPublicIpIds = @{}  # keep track of Public IPs we already added to CSV (from NICs)
+$orphanedPublicIPs = @()
 
 # Initialize Draw.IO document structure
 $drawio = @"
@@ -55,8 +72,36 @@ foreach ($sub in $subscriptions) {
     Write-Host "Processing subscription: $($sub.Name) ($($sub.Id))" -ForegroundColor Cyan
     Set-AzContext -SubscriptionId $sub.Id | Out-Null
 
-    # Get VNets
+    # Get all VNets
     $vnets = Get-AzVirtualNetwork
+
+    # Batch fetch all NICs and Public IPs for this subscription (much faster than per-VNet queries)
+    $allNics = @(Get-AzNetworkInterface -ErrorAction SilentlyContinue)
+    $allPublicIps = @(Get-AzPublicIpAddress -ErrorAction SilentlyContinue)
+    $allNsgs = @(Get-AzNetworkSecurityGroup -ErrorAction SilentlyContinue)
+
+    # Index NICs by VNet Id
+    $nicsByVnet = @{}
+    foreach ($nic in $allNics) {
+        if ($nic.VirtualNetwork -and $nic.VirtualNetwork.Id) {
+            $vnetId = $nic.VirtualNetwork.Id
+            if (-not $nicsByVnet.ContainsKey($vnetId)) { $nicsByVnet[$vnetId] = @() }
+            $nicsByVnet[$vnetId] += $nic
+        }
+    }
+
+    # Index Public IPs by Id for orphan detection
+    $publicIpsById = @{}
+    foreach ($pip in $allPublicIps) {
+        $publicIpsById[$pip.Id] = $pip
+    }
+
+    # Index NSGs by Id for quick lookup
+    $nsgsById = @{}
+    foreach ($nsg in $allNsgs) {
+        $nsgsById[$nsg.Id] = $nsg
+    }
+
     foreach ($vnet in $vnets) {
         $vnetId = "vnet_$($vnet.Id -replace '[^a-zA-Z0-9]', '_')"
         $vnetName = $vnet.Name
@@ -83,7 +128,8 @@ foreach ($sub in $subscriptions) {
 "@
             $nodeIdCounter++
 
-            # Record subnet data
+            # Record subnet data including NSG association
+            $nsgName = if ($subnet.NetworkSecurityGroup) { $subnet.NetworkSecurityGroup.Id -replace '.*/' } else { '' }
             $allResources += [PSCustomObject]@{
                 Subscription = $sub.Name
                 SubscriptionId = $sub.Id
@@ -92,12 +138,12 @@ foreach ($sub in $subscriptions) {
                 Name = $subnetName
                 VNet = $vnetName
                 AddressPrefix = $subnetPrefix
-                NSG = $subnet.NetworkSecurityGroup?.Id -replace '.*/'
+                NSG = $nsgName
             }
         }
 
-        # Get NICs in this VNet
-        $nics = Get-AzNetworkInterface | Where-Object { $_.VirtualNetwork -and $_.VirtualNetwork.Id -eq $vnet.Id }
+        # Get NICs in this VNet from the pre-queried batch
+        $nics = $nicsByVnet[$vnet.Id] ?? @()
         foreach ($nic in $nics) {
             $nicId = "nic_$($nic.Id -replace '[^a-zA-Z0-9]', '_')"
             $nicName = $nic.Name
@@ -113,9 +159,18 @@ foreach ($sub in $subscriptions) {
 "@
             $nodeIdCounter++
 
+            # Build edge label: show NSG(s) if present
+            $nsgLabels = @()
+            $subnetNsg = $vnet.Subnets | Where-Object { $_.Id -eq $ipConfig.Subnet.Id } | Select-Object -ExpandProperty NetworkSecurityGroup -ErrorAction SilentlyContinue
+            if ($subnetNsg) { $nsgLabels += ($subnetNsg.Id -replace '.*/') }
+            if ($nic.NetworkSecurityGroup) { $nsgLabels += ($nic.NetworkSecurityGroup.Id -replace '.*/') }
+            $edgeLabel = if ($nsgLabels.Count -gt 0) { "NSG: $($nsgLabels -join ', ')" } else { '' }
+            $edgeStyle = "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;"
+            if ($edgeLabel) { $edgeStyle += "labelBackgroundColor=#FFF9C4;" }
+
             # Edge from subnet to NIC
             $diagramEdges += @"
-            <mxCell id="edge_$($nodeIdCounter)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="$subnetRef" target="$nicId" edge="1">
+            <mxCell id="edge_$($nodeIdCounter)" value="$edgeLabel" style="$edgeStyle" parent="1" source="$subnetRef" target="$nicId" edge="1">
               <mxGeometry relative="1" as="geometry"/>
             </mxCell>
 "@
@@ -123,10 +178,10 @@ foreach ($sub in $subscriptions) {
 
             # Check for Public IP on NIC
             if ($ipConfig.PublicIPAddress) {
-                $publicIp = $ipConfig.PublicIPAddress
-                $pipId = "pip_$($publicIp.Id -replace '[^a-zA-Z0-9]', '_')"
-                $pipName = $publicIp.Name
-                $pipAddress = $publicIp.IpAddress
+                $publicIpObj = $ipConfig.PublicIPAddress
+                $pipId = "pip_$($publicIpObj.Id -replace '[^a-zA-Z0-9]', '_')"
+                $pipName = $publicIpObj.Name
+                $pipAddress = $publicIpObj.IpAddress
 
                 $diagramNodes += @"
                 <mxCell id="$pipId" value="$pipName`n$pipAddress" style="shape=cloud;whiteSpace=wrap;html=1;fillColor=#FFEBEE;strokeColor=#000000;" vertex="1" parent="1">
@@ -151,7 +206,11 @@ foreach ($sub in $subscriptions) {
                     Name = $pipName
                     IPAddress = $pipAddress
                     AssociatedWith = $nicName
-                }
+                    Orphaned = $false
+                $recordedPublicIpIds[$pipId] = $true
+            } else {
+                # Mark Public IPs that are NOT attached to this NIC as potentially orphaned (we'll check later)
+                # No action needed here; we'll process after the loops
             }
 
             $allResources += [PSCustomObject]@{
@@ -163,12 +222,55 @@ foreach ($sub in $subscriptions) {
                 PrivateIP = $privateIp
                 Subnet = $subnetName
                 VNet = $vnetName
+                NSG = if ($nic.NetworkSecurityGroup) { $nic.NetworkSecurityGroup.Id -replace '.*/' } else { '' }
             }
         }
+
+        # Also handle Public IPs that might be attached to Load Balancers or Application Gateways (briefly)
+        # We'll do orphan detection globally after processing all subscriptions
     }
 }
 
 # Close Draw.IO XML
+# Detect orphaned Public IPs (unused) across all subscriptions
+Write-Host "`nDetecting orphaned public IPs..." -ForegroundColor Cyan
+foreach ($sub in $subscriptions) {
+    Set-AzContext -SubscriptionId $sub.Id | Out-Null
+    $allPips = Get-AzPublicIpAddress -ErrorAction SilentlyContinue
+    foreach ($pip in $allPips) {
+        $pipId = $pip.Id
+        if ($recordedPublicIpIds.ContainsKey($pipId)) { continue }
+
+        $isAttached = $false
+        if ($pip.IpConfiguration) { $isAttached = $true }
+        elseif ($pip.LoadBalancer) { $isAttached = $true }
+        elseif ($pip.ApplicationGateway) { $isAttached = $true }
+
+        $orphanStatus = -not $isAttached
+        if ($orphanStatus) {
+            $orphanedPublicIPs += $pip
+        }
+
+        $allResources += [PSCustomObject]@{
+            Subscription = $sub.Name
+            SubscriptionId = $sub.Id
+            ResourceGroup = $pip.ResourceGroupName
+            Type = "PublicIP"
+            Name = $pip.Name
+            IPAddress = $pip.IpAddress
+            AssociatedWith = if ($isAttached) { 'LoadBalancer/AppGateway' } else { '' }
+            Orphaned = $orphanStatus
+        }
+    }
+}
+
+# Summary of orphans
+if ($orphanedPublicIPs.Count -gt 0) {
+    Write-Host "Found $($orphanedPublicIPs.Count) orphaned public IP(s) (not attached to any resource)." -ForegroundColor Yellow
+} else {
+    Write-Host "No orphaned public IPs found." -ForegroundColor Green
+}
+
 $drawio += $diagramNodes -join "`n"
 $drawio += $diagramEdges -join "`n"
 $drawio += @"
