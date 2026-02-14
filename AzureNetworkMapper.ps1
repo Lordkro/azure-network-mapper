@@ -7,15 +7,10 @@
 param()
 
 [CmdletBinding()]
-param(
-    [switch]$UseResourceGraph
-)
+param()
 
-# Ensure required Az modules are installed
+# Ensure required Az modules are installed (lightweight)
 $requiredModules = @('Az.Accounts', 'Az.Network')
-if ($UseResourceGraph) {
-    $requiredModules += 'Az.ResourceGraph'
-}
 $missingModules = @()
 foreach ($mod in $requiredModules) {
     if (-not (Get-Module -ListAvailable -Name $mod)) {
