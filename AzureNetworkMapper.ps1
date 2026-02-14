@@ -137,6 +137,9 @@ foreach ($sub in $subscriptions) {
             }
         }
 
+        # Fetch Load Balancers and Application Gateways for this subscription (already batched above)
+        # We'll process them after NICs to connect backend pools to NICs
+
         # Get NICs in this VNet from the pre-queried batch
         $nics = $nicsByVnet[$vnet.Id] ?? @()
         foreach ($nic in $nics) {
@@ -218,6 +221,131 @@ foreach ($sub in $subscriptions) {
                 Subnet = $subnetName
                 VNet = $vnetName
                 NSG = if ($nic.NetworkSecurityGroup) { $nic.NetworkSecurityGroup.Id -replace '.*/' } else { '' }
+            }
+        }
+
+        # Process Load Balancers that have frontend in this VNet
+        foreach ($lb in $loadBalancers) {
+            $lbFrontendIpConfig = $lb.FrontendIpConfigurations | Where-Object { $_.Subnet -and $_.Subnet.Id -eq $vnet.Id }
+            if (-not $lbFrontendIpConfig) { continue }
+
+            $lbId = "lb_$($lb.Id -replace '[^a-zA-Z0-9]', '_')"
+            $lbName = $lb.Name
+            $lbFrontendIp = $lbFrontendIpConfig.PublicIPAddress?.IpAddress ??
+                            ($lbFrontendIpConfig.PrivateIPAddress ? "Private: $($lbFrontendIpConfig.PrivateIPAddress)" : "No IP")
+
+            # Create Load Balancer node
+            $diagramNodes += @"
+            <mxCell id="$lbId" value="LB`n$lbName`n$lbFrontendIp" style="shape=umlLollipop;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#000000;" vertex="1" parent="1">
+              <mxGeometry x="$(($nodeIdCounter % 10) * 100)" y="$(([math]::Floor($nodeIdCounter / 10) * 100) + 200)" width="120" height="60" as="geometry"/>
+            </mxCell>
+"@
+            $nodeIdCounter++
+
+            # Edge from LB frontend to VNet (representing it's frontend in this VNet)
+            $edgeStyle = "edgeStyle=elbowEdgeStyle;endArrow=none;html=1;strokeColor=#2196F3;"
+            $diagramEdges += @"
+            <mxCell id="edge_lb_vnet_$($nodeIdCounter)" value="Frontend" style="$edgeStyle" parent="1" source="$lbId" target="$vnetId" edge="1">
+              <mxGeometry relative="1" as="geometry"/>
+            </mxCell>
+"@
+            $nodeIdCounter++
+
+            # Backend pools: connect LB to NICs in this VNet that belong to its backend pools
+            foreach ($pool in $lb.BackendAddressPools) {
+                foreach ($nicRef in $pool.BackendIPConfigurations) {
+                    # Find the NIC that matches this IP config ID
+                    $targetNic = $nics | Where-Object { $_.Id -eq $nicRef.Id }
+                    if (-not $targetNic) { continue }
+
+                    $targetNicId = "nic_$($targetNic.Id -replace '[^a-zA-Z0-9]', '_')"
+                    $ruleLabel = "Backend: $($pool.Name)"
+                    if ($lb.LoadBalancingRules | Where-Object { $_.BackendAddressPool.Id -eq $pool.Id }) {
+                        $rule = $lb.LoadBalancingRules | Where-Object { $_.BackendAddressPool.Id -eq $pool.Id } | Select-Object -First 1
+                        $ruleLabel += "`n$($rule.Protocol):$($rule.Port)"
+                    }
+
+                    $diagramEdges += @"
+                    <mxCell id="edge_lb_backend_$($nodeIdCounter)" value="$ruleLabel" style="edgeStyle=orthogonalEdgeStyle;endArrow=block;html=1;strokeColor=#1976D2;labelBackgroundColor=#BBDEFB;" parent="1" source="$lbId" target="$targetNicId" edge="1">
+                      <mxGeometry relative="1" as="geometry"/>
+                    </mxCell>
+"@
+                    $nodeIdCounter++
+                }
+            }
+
+            $allResources += [PSCustomObject]@{
+                Subscription = $sub.Name
+                SubscriptionId = $sub.Id
+                ResourceGroup = $lb.ResourceGroupName
+                Type = "LoadBalancer"
+                Name = $lbName
+                FrontendIP = $lbFrontendIp
+                BackendPools = ($lb.BackendAddressPools.Name -join ', ')
+                LoadBalancingRules = ($lb.LoadBalancingRules | ForEach-Object { "$($_.Protocol):$($_.Port)" } -join ', ')
+            }
+        }
+
+        # Process Application Gateways that have frontend in this VNet
+        foreach ($appGw in $appGateways) {
+            $appGwFrontendIpConfig = $appGw.FrontendIPConfigurations | Where-Object { $_.Subnet -and $_.Subnet.Id -eq $vnet.Id }
+            if (-not $appGwFrontendIpConfig) { continue }
+
+            $appGwId = "agw_$($appGw.Id -replace '[^a-zA-Z0-9]', '_')"
+            $appGwName = $appGw.Name
+            $frontendIp = $appGwFrontendIpConfig.PublicIPAddress?.IpAddress ??
+                          ($appGwFrontendIpConfig.PrivateIPAddress ? "Private: $($appGwFrontendIpConfig.PrivateIPAddress)" : "No IP")
+
+            # Create App Gateway node
+            $diagramNodes += @"
+            <mxCell id="$appGwId" value="AppGw`n$appGwName`n$frontendIp" style="shape=umlLollipop;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#000000;" vertex="1" parent="1">
+              <mxGeometry x="$(($nodeIdCounter % 10) * 100 + 50)" y="$(([math]::Floor($nodeIdCounter / 10) * 100) + 200)" width="140" height="60" as="geometry"/>
+            </mxCell>
+"@
+            $nodeIdCounter++
+
+            # Edge from AppGw frontend to VNet
+            $edgeStyle = "edgeStyle=elbowEdgeStyle;endArrow=none;html=1;strokeColor=#9C27B0;"
+            $diagramEdges += @"
+            <mxCell id="edge_agw_vnet_$($nodeIdCounter)" value="Frontend" style="$edgeStyle" parent="1" source="$appGwId" target="$vnetId" edge="1">
+              <mxGeometry relative="1" as="geometry"/>
+            </mxCell>
+"@
+            $nodeIdCounter++
+
+            # Backend pools: connect AppGw to NICs
+            foreach ($pool in $appGw.BackendAddressPools) {
+                foreach ($nicRef in $pool.BackendIPConfigurations) {
+                    $targetNic = $nics | Where-Object { $_.Id -eq $nicRef.Id }
+                    if (-not $targetNic) { continue }
+
+                    $targetNicId = "nic_$($targetNic.Id -replace '[^a-zA-Z0-9]', '_')"
+                    $ruleLabel = "Backend: $($pool.Name)"
+                    # Try to find associated HTTP setting and listener for this pool
+                    $relatedRule = $appGw.HttpListeners | Where-Object { $_.DefaultBackendAddressPool.Id -eq $pool.Id } | Select-Object -First 1
+                    if ($relatedRule) {
+                        $ruleLabel += "`n$($relatedRule.Protocol):$($relatedRule.Port)"
+                    }
+
+                    $diagramEdges += @"
+                    <mxCell id="edge_agw_backend_$($nodeIdCounter)" value="$ruleLabel" style="edgeStyle=orthogonalEdgeStyle;endArrow=block;html=1;strokeColor=#7B1FA2;labelBackgroundColor=#E1BEE7;" parent="1" source="$appGwId" target="$targetNicId" edge="1">
+                      <mxGeometry relative="1" as="geometry"/>
+                    </mxCell>
+"@
+                    $nodeIdCounter++
+                }
+            }
+
+            $allResources += [PSCustomObject]@{
+                Subscription = $sub.Name
+                SubscriptionId = $sub.Id
+                ResourceGroup = $appGw.ResourceGroupName
+                Type = "ApplicationGateway"
+                Name = $appGwName
+                FrontendIP = $frontendIp
+                BackendPools = ($appGw.BackendAddressPools.Name -join ', ')
+                HttpListeners = ($appGw.HttpListeners | ForEach-Object { "$($_.Protocol):$($_.Port)" } -join ', ')
+                Sku = $appGw.Sku.Name
             }
         }
 
