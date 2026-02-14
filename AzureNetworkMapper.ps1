@@ -284,6 +284,26 @@ foreach ($sub in $subscriptions) {
                 BackendPools = ($lb.BackendAddressPools.Name -join ', ')
                 LoadBalancingRules = ($lb.LoadBalancingRules | ForEach-Object { "$($_.Protocol):$($_.Port)" } -join ', ')
             }
+
+            # Also record the Frontend Public IP if it exists
+            if ($lbFrontendIpConfig.PublicIPAddress) {
+                $lbPip = $lbFrontendIpConfig.PublicIPAddress
+                $lbPipId = "pip_$($lbPip.Id -replace '[^a-zA-Z0-9]', '_')"
+                if (-not $recordedPublicIpIds.ContainsKey($lbPipId)) {
+                    $isAttached = $true  # attached to LB
+                    $allResources += [PSCustomObject]@{
+                        Subscription = $sub.Name
+                        SubscriptionId = $sub.Id
+                        ResourceGroup = $lbPip.ResourceGroupName
+                        Type = "PublicIP"
+                        Name = $lbPip.Name
+                        IPAddress = $lbPip.IpAddress
+                        AssociatedWith = "LB: $lbName"
+                        Orphaned = $false
+                    }
+                    $recordedPublicIpIds[$lbPipId] = $true
+                }
+            }
         }
 
         # Process Application Gateways that have frontend in this VNet
@@ -346,6 +366,25 @@ foreach ($sub in $subscriptions) {
                 BackendPools = ($appGw.BackendAddressPools.Name -join ', ')
                 HttpListeners = ($appGw.HttpListeners | ForEach-Object { "$($_.Protocol):$($_.Port)" } -join ', ')
                 Sku = $appGw.Sku.Name
+            }
+
+            # Also record the Frontend Public IP if it exists (for orphan detection and CSV)
+            if ($appGwFrontendIpConfig.PublicIPAddress) {
+                $agwPip = $appGwFrontendIpConfig.PublicIPAddress
+                $agwPipId = "pip_$($agwPip.Id -replace '[^a-zA-Z0-9]', '_')"
+                if (-not $recordedPublicIpIds.ContainsKey($agwPipId)) {
+                    $allResources += [PSCustomObject]@{
+                        Subscription = $sub.Name
+                        SubscriptionId = $sub.Id
+                        ResourceGroup = $agwPip.ResourceGroupName
+                        Type = "PublicIP"
+                        Name = $agwPip.Name
+                        IPAddress = $agwPip.IpAddress
+                        AssociatedWith = "AppGw: $appGwName"
+                        Orphaned = $false
+                    }
+                    $recordedPublicIpIds[$agwPipId] = $true
+                }
             }
         }
 
