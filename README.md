@@ -20,7 +20,11 @@ A PowerShell script that maps your entire Azure tenant's network infrastructure 
 ## Prerequisites
 
 - **PowerShell 5.1** or later
-- **Az PowerShell module**: `Install-Module -Name Az -Scope CurrentUser -Repository PSGallery -Force`
+- **Minimal Az modules** (lightweight, ~30MB total vs ~500MB for full Az):
+  ```powershell
+  Install-Module -Name Az.Accounts -Scope CurrentUser -Repository PSGallery -Force
+  Install-Module -Name Az.Network -Scope CurrentUser -Repository PSGallery -Force
+  ```
 - Azure authentication: You must be logged in (`Connect-AzAccount`) or have sufficient permissions to read network resources
 
 ## Usage
