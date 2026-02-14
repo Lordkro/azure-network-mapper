@@ -70,12 +70,18 @@ Visual topology with containers for VNets, nested subnets, and connected resourc
 
 ## Future Enhancements
 
-- [ ] Include Load Balancers and Application Gateways
-- [ ] Add NSG rules as edge labels
-- [ ] Detect orphaned/unused public IPs
-- [ ] Export to PowerPoint/Visio
-- [ ] Support for Azure Firewall, Route Tables
+- [ ] Include Load Balancers and Application Gateways (with backend pools, rules)
+- [ ] Add NSG rules as edge labels on subnet connections
+- [ ] Detect orphaned/unused public IPs (cost savings)
+- [ ] Include Azure Firewall and Route Tables
 - [ ] Query Azure Resource Graph for faster enumeration (large tenants)
+- [ ] Add Azure Bastion hosts
+- [ ] Show VPN Gateways / ExpressRoute circuits
+- [ ] Highlight overlapping IP ranges across VNets
+- [ ] Export to HTML interactive report
+- [ ] Support for Private Endpoints and Private DNS Zones
+- [ ] Include Application Security Groups (ASGs)
+- [ ] Integrate with Azure Policy to show non-compliant resources
 
 ## License
 
