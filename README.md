@@ -49,13 +49,16 @@ The script will:
 
 1. Go to https://app.diagrams.net/
 2. File → Import → Select the `.drawio` file
-3. The diagram shows:
-   - **Rectangles** = VNets (with address space label)
-   - **Inner rectangles** = Subnets (with CIDR label)
-   - **Ellipses** = NICs/VMs (with private IP)
-   - **Clouds** = Public IPs
-   - **Connections** = relationships between resources
-   - **Colors** = different Azure subscriptions
+3. The file contains **two pages**:
+   - **"Azure Network Topology"** — the visual map
+   - **"Legend"** — explains the shapes, colors, and connections
+4. Switch between pages using the page tabs at the bottom
+
+**Legend page includes:**
+- What each shape means (VNet, Subnet, NIC, Public IP)
+- Color coding (subscriptions)
+- Connection types
+- Quick reference guide
 
 ## Example Output
 
