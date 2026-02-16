@@ -1,13 +1,16 @@
 # Azure Network Inventory Mapper
-# Exports network topology to CSV + Draw.IO diagram
-# Author: Cass (OpenClaw)
-# Version: 1.0
+# Exports network topology to CSV
+# Author: Lordkro
+# Version: 1.2 - Optimized with parallel processing
+
+#Requires -Version 7.0
 
 [CmdletBinding()]
-param()
-
-[CmdletBinding()]
-param()
+param(
+    [Parameter(HelpMessage = "Maximum number of subscriptions to process in parallel")]
+    [ValidateRange(1, 20)]
+    [int]$MaxParallelSubscriptions = 5
+)
 
 # Ensure required Az modules are installed (lightweight)
 $requiredModules = @('Az.Accounts', 'Az.Network')
@@ -31,426 +34,304 @@ if (-not $context) {
 
 # Get all subscriptions in tenant
 Write-Host "Fetching subscriptions..." -ForegroundColor Cyan
-$subscriptions = Get-AzSubscription
+$subscriptions = @(Get-AzSubscription)
 Write-Host "Found $($subscriptions.Count) subscriptions" -ForegroundColor Green
 
-$allResources = @()
-$diagramNodes = @()
-$diagramEdges = @()
-$recordedPublicIpIds = @{}  # keep track of Public IPs we already added to CSV (from NICs)
-$orphanedPublicIPs = @()
+# Thread-safe collections for parallel processing
+$allResources = [System.Collections.Concurrent.ConcurrentBag[PSCustomObject]]::new()
+$recordedPublicIpIds = [System.Collections.Concurrent.ConcurrentDictionary[string, bool]]::new()
+$orphanedPublicIPs = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+$processedCount = [ref]0
+$totalSubs = $subscriptions.Count
 
-# Initialize Draw.IO document structure
-$drawio = @"
-<?xml version="1.0" encoding="UTF-8"?>
-<mxfile host="app.diagrams.net">
-  <diagram name="Azure Network Topology">
-    <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
-      <root>
-        <mxCell id="0"/>
-        <mxCell id="1" parent="0"/>
-"@
+Write-Host "Processing subscriptions in parallel (max $MaxParallelSubscriptions at a time)..." -ForegroundColor Cyan
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-$nodeIdCounter = 2
-$subscriptionColors = @{}
-$random = [System.Random]::new()
+$subscriptions | ForEach-Object -ThrottleLimit $MaxParallelSubscriptions -Parallel {
+    $sub = $_
+    # Import thread-safe collections from parent scope
+    $resources = $using:allResources
+    $recordedPips = $using:recordedPublicIpIds
+    $orphanPips = $using:orphanedPublicIPs
+    
+    try {
+        # Each parallel runspace needs its own Az context
+        Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop | Out-Null
+        Write-Host "  [$($sub.Name)] Starting..." -ForegroundColor Gray
 
-# Helper: Generate a color per subscription
-function Get-SubscriptionColor($subId) {
-    if (-not $subscriptionColors.ContainsKey($subId)) {
-        $subscriptionColors[$subId] = "#$($random.Next(0x1000000).ToString('X6') | ForEach-Object { $_.PadLeft(6, '0') })"
-    }
-    return $subscriptionColors[$subId]
-}
+        # Get all VNets
+        $vnets = @(Get-AzVirtualNetwork -ErrorAction SilentlyContinue)
 
-foreach ($sub in $subscriptions) {
-    Write-Host "Processing subscription: $($sub.Name) ($($sub.Id))" -ForegroundColor Cyan
-    Set-AzContext -SubscriptionId $sub.Id | Out-Null
+        # Batch fetch all resources for this subscription
+        $allNics = @(Get-AzNetworkInterface -ErrorAction SilentlyContinue)
+        $allPublicIps = @(Get-AzPublicIpAddress -ErrorAction SilentlyContinue)
+        $allNsgs = @(Get-AzNetworkSecurityGroup -ErrorAction SilentlyContinue)
+        $loadBalancers = @(Get-AzLoadBalancer -ErrorAction SilentlyContinue)
+        $appGateways = @(Get-AzApplicationGateway -ErrorAction SilentlyContinue)
 
-    # Get all VNets
-    $vnets = Get-AzVirtualNetwork
-
-    # Batch fetch all NICs and Public IPs for this subscription (much faster than per-VNet queries)
-    $allNics = @(Get-AzNetworkInterface -ErrorAction SilentlyContinue)
-    $allPublicIps = @(Get-AzPublicIpAddress -ErrorAction SilentlyContinue)
-    $allNsgs = @(Get-AzNetworkSecurityGroup -ErrorAction SilentlyContinue)
-
-    # Index NICs by VNet Id
-    $nicsByVnet = @{}
-    foreach ($nic in $allNics) {
-        if ($nic.VirtualNetwork -and $nic.VirtualNetwork.Id) {
-            $vnetId = $nic.VirtualNetwork.Id
-            if (-not $nicsByVnet.ContainsKey($vnetId)) { $nicsByVnet[$vnetId] = @() }
-            $nicsByVnet[$vnetId] += $nic
-        }
-    }
-
-    # Index Public IPs by Id for orphan detection
-    $publicIpsById = @{}
-    foreach ($pip in $allPublicIps) {
-        $publicIpsById[$pip.Id] = $pip
-    }
-
-    # Index NSGs by Id for quick lookup
-    $nsgsById = @{}
-    foreach ($nsg in $allNsgs) {
-        $nsgsById[$nsg.Id] = $nsg
-    }
-
-    foreach ($vnet in $vnets) {
-        $vnetId = "vnet_$($vnet.Id -replace '[^a-zA-Z0-9]', '_')"
-        $vnetName = $vnet.Name
-
-        # Add VNet node to diagram (subnet container)
-        $vnetColor = Get-SubscriptionColor $sub.Id
-        $diagramNodes += @"
-        <mxCell id="$vnetId" value="$vnetName`n$($vnet.AddressSpace.AddressPrefixes -join ', ')" style="rounded=1;whiteSpace=wrap;html=1;fillColor=$vnetColor;strokeColor=#000000;" vertex="1" parent="1">
-          <mxGeometry x="$(($nodeIdCounter % 10) * 100)" y="$(([math]::Floor($nodeIdCounter / 10) * 100))" width="200" height="80" as="geometry"/>
-        </mxCell>
-"@
-        $nodeIdCounter++
-
-        # Process subnets
-        foreach ($subnet in $vnet.Subnets) {
-            $subnetId = "subnet_$($subnet.Id -replace '[^a-zA-Z0-9]', '_')"
-            $subnetName = $subnet.Name
-            $subnetPrefix = $subnet.AddressPrefix
-
-            $diagramNodes += @"
-            <mxCell id="$subnetId" value="$subnetName`n$subnetPrefix" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E8F5E9;strokeColor=#000000;" vertex="1" parent="$vnetId">
-              <mxGeometry x="20" y="20" width="160" height="40" as="geometry"/>
-            </mxCell>
-"@
-            $nodeIdCounter++
-
-            # Record subnet data including NSG association
-            $nsgName = if ($subnet.NetworkSecurityGroup) { $subnet.NetworkSecurityGroup.Id -replace '.*/' } else { '' }
-            $allResources += [PSCustomObject]@{
-                Subscription = $sub.Name
-                SubscriptionId = $sub.Id
-                ResourceGroup = $vnet.ResourceGroupName
-                Type = "Subnet"
-                Name = $subnetName
-                VNet = $vnetName
-                AddressPrefix = $subnetPrefix
-                NSG = $nsgName
+        # Index NICs by VNet Id (via subnet association)
+        $nicsByVnet = @{}
+        foreach ($nic in $allNics) {
+            foreach ($ipConfig in $nic.IpConfigurations) {
+                if ($ipConfig.Subnet -and $ipConfig.Subnet.Id) {
+                    $subnetId = $ipConfig.Subnet.Id
+                    $vnetId = $subnetId -replace '/subnets/.*$', ''
+                    if (-not $nicsByVnet.ContainsKey($vnetId)) { $nicsByVnet[$vnetId] = @() }
+                    if ($nicsByVnet[$vnetId] -notcontains $nic) {
+                        $nicsByVnet[$vnetId] += $nic
+                    }
+                }
             }
         }
 
-        # Fetch Load Balancers and Application Gateways for this subscription (already batched above)
-        # We'll process them after NICs to connect backend pools to NICs
+        # Index Public IPs by Id for quick lookup
+        $publicIpsById = @{}
+        foreach ($pip in $allPublicIps) {
+            $publicIpsById[$pip.Id] = $pip
+        }
 
-        # Get NICs in this VNet from the pre-queried batch
-        $nics = $nicsByVnet[$vnet.Id] ?? @()
-        foreach ($nic in $nics) {
-            $nicId = "nic_$($nic.Id -replace '[^a-zA-Z0-9]', '_')"
-            $nicName = $nic.Name
-            $ipConfig = $nic.IPConfigurations[0]
-            $privateIp = $ipConfig.PrivateIPAddress
-            $subnetRef = "subnet_$($ipConfig.Subnet.Id -replace '[^a-zA-Z0-9]', '_')"
+        foreach ($vnet in $vnets) {
+            $vnetName = $vnet.Name
 
-            # Create NIC node (outside VNet container, connected to subnet)
-            $diagramNodes += @"
-            <mxCell id="$nicId" value="$nicName`n$privateIp" style="shape=ellipse;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#000000;" vertex="1" parent="1">
-              <mxGeometry x="$(($nodeIdCounter % 10) * 100 + 50)" y="$(([math]::Floor($nodeIdCounter / 10) * 100) + 120)" width="120" height="40" as="geometry"/>
-            </mxCell>
-"@
-            $nodeIdCounter++
+            # Process subnets
+            foreach ($subnet in $vnet.Subnets) {
+                $subnetName = $subnet.Name
+                $subnetPrefix = if ($subnet.AddressPrefix -is [System.Collections.IEnumerable] -and $subnet.AddressPrefix -isnot [string]) {
+                    ($subnet.AddressPrefix -join ', ')
+                } else {
+                    $subnet.AddressPrefix
+                }
 
-            # Build edge label: show NSG(s) if present
-            $nsgLabels = @()
-            $subnetNsg = $vnet.Subnets | Where-Object { $_.Id -eq $ipConfig.Subnet.Id } | Select-Object -ExpandProperty NetworkSecurityGroup -ErrorAction SilentlyContinue
-            if ($subnetNsg) { $nsgLabels += ($subnetNsg.Id -replace '.*/') }
-            if ($nic.NetworkSecurityGroup) { $nsgLabels += ($nic.NetworkSecurityGroup.Id -replace '.*/') }
-            $edgeLabel = if ($nsgLabels.Count -gt 0) { "NSG: $($nsgLabels -join ', ')" } else { '' }
-            $edgeStyle = "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;"
-            if ($edgeLabel) { $edgeStyle += "labelBackgroundColor=#FFF9C4;" }
-
-            # Edge from subnet to NIC
-            $diagramEdges += @"
-            <mxCell id="edge_$($nodeIdCounter)" value="$edgeLabel" style="$edgeStyle" parent="1" source="$subnetRef" target="$nicId" edge="1">
-              <mxGeometry relative="1" as="geometry"/>
-            </mxCell>
-"@
-            $nodeIdCounter++
-
-            # Check for Public IP on NIC
-            if ($ipConfig.PublicIPAddress) {
-                $publicIpObj = $ipConfig.PublicIPAddress
-                $pipId = "pip_$($publicIpObj.Id -replace '[^a-zA-Z0-9]', '_')"
-                $pipName = $publicIpObj.Name
-                $pipAddress = $publicIpObj.IpAddress
-
-                $diagramNodes += @"
-                <mxCell id="$pipId" value="$pipName`n$pipAddress" style="shape=cloud;whiteSpace=wrap;html=1;fillColor=#FFEBEE;strokeColor=#000000;" vertex="1" parent="1">
-                  <mxGeometry x="$(($nodeIdCounter % 10) * 100 + 100)" y="$(([math]::Floor($nodeIdCounter / 10) * 100) + 180)" width="100" height="50" as="geometry"/>
-                </mxCell>
-"@
-                $nodeIdCounter++
-
-                # Edge from NIC to Public IP
-                $diagramEdges += @"
-                <mxCell id="edge_$($nodeIdCounter)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="$nicId" target="$pipId" edge="1">
-                  <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-"@
-                $nodeIdCounter++
-
-                $allResources += [PSCustomObject]@{
-                    Subscription = $sub.Name
+                $nsgName = if ($subnet.NetworkSecurityGroup) { $subnet.NetworkSecurityGroup.Id -replace '.*/' } else { '' }
+                $resources.Add([PSCustomObject]@{
+                    Subscription   = $sub.Name
                     SubscriptionId = $sub.Id
-                    ResourceGroup = $nic.ResourceGroupName
-                    Type = "PublicIP"
-                    Name = $pipName
-                    IPAddress = $pipAddress
-                    AssociatedWith = $nicName
-                    Orphaned = $false
-                $recordedPublicIpIds[$pipId] = $true
-            } else {
-                # Mark Public IPs that are NOT attached to this NIC as potentially orphaned (we'll check later)
-                # No action needed here; we'll process after the loops
+                    ResourceGroup  = $vnet.ResourceGroupName
+                    Type           = "Subnet"
+                    Name           = $subnetName
+                    VNet           = $vnetName
+                    IPRange        = $subnetPrefix
+                    PrivateIP      = ''
+                    PublicIP       = ''
+                    NSG            = $nsgName
+                    AssociatedWith = ''
+                })
             }
 
-            $allResources += [PSCustomObject]@{
-                Subscription = $sub.Name
-                SubscriptionId = $sub.Id
-                ResourceGroup = $nic.ResourceGroupName
-                Type = "NetworkInterface"
-                Name = $nicName
-                PrivateIP = $privateIp
-                Subnet = $subnetName
-                VNet = $vnetName
-                NSG = if ($nic.NetworkSecurityGroup) { $nic.NetworkSecurityGroup.Id -replace '.*/' } else { '' }
-            }
-        }
+            # Get NICs in this VNet
+            $nics = $nicsByVnet[$vnet.Id] ?? @()
+            
+            foreach ($nic in $nics) {
+                $nicName = $nic.Name
+                $ipConfig = $nic.IPConfigurations[0]
+                $privateIp = $ipConfig.PrivateIPAddress
+                $nicSubnetName = $ipConfig.Subnet.Id -replace '.*/subnets/', '' -replace '/.*', ''
 
-        # Process Load Balancers that have frontend in this VNet
-        foreach ($lb in $loadBalancers) {
-            $lbFrontendIpConfig = $lb.FrontendIpConfigurations | Where-Object { $_.Subnet -and $_.Subnet.Id -eq $vnet.Id }
-            if (-not $lbFrontendIpConfig) { continue }
+                # Check for Public IP on NIC
+                if ($ipConfig.PublicIPAddress) {
+                    $publicIpObj = $ipConfig.PublicIPAddress
+                    $pipId = "pip_$($publicIpObj.Id -replace '[^a-zA-Z0-9]', '_')"
+                    $pipName = $publicIpObj.Name
+                    # Get actual IP address from our indexed collection
+                    $pipAddress = if ($publicIpsById.ContainsKey($publicIpObj.Id)) { $publicIpsById[$publicIpObj.Id].IpAddress } else { '' }
 
-            $lbId = "lb_$($lb.Id -replace '[^a-zA-Z0-9]', '_')"
-            $lbName = $lb.Name
-            $lbFrontendIp = $lbFrontendIpConfig.PublicIPAddress?.IpAddress ??
-                            ($lbFrontendIpConfig.PrivateIPAddress ? "Private: $($lbFrontendIpConfig.PrivateIPAddress)" : "No IP")
-
-            # Create Load Balancer node
-            $diagramNodes += @"
-            <mxCell id="$lbId" value="LB`n$lbName`n$lbFrontendIp" style="shape=umlLollipop;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#000000;" vertex="1" parent="1">
-              <mxGeometry x="$(($nodeIdCounter % 10) * 100)" y="$(([math]::Floor($nodeIdCounter / 10) * 100) + 200)" width="120" height="60" as="geometry"/>
-            </mxCell>
-"@
-            $nodeIdCounter++
-
-            # Edge from LB frontend to VNet (representing it's frontend in this VNet)
-            $edgeStyle = "edgeStyle=elbowEdgeStyle;endArrow=none;html=1;strokeColor=#2196F3;"
-            $diagramEdges += @"
-            <mxCell id="edge_lb_vnet_$($nodeIdCounter)" value="Frontend" style="$edgeStyle" parent="1" source="$lbId" target="$vnetId" edge="1">
-              <mxGeometry relative="1" as="geometry"/>
-            </mxCell>
-"@
-            $nodeIdCounter++
-
-            # Backend pools: connect LB to NICs in this VNet that belong to its backend pools
-            foreach ($pool in $lb.BackendAddressPools) {
-                foreach ($nicRef in $pool.BackendIPConfigurations) {
-                    # Find the NIC that matches this IP config ID
-                    $targetNic = $nics | Where-Object { $_.Id -eq $nicRef.Id }
-                    if (-not $targetNic) { continue }
-
-                    $targetNicId = "nic_$($targetNic.Id -replace '[^a-zA-Z0-9]', '_')"
-                    $ruleLabel = "Backend: $($pool.Name)"
-                    if ($lb.LoadBalancingRules | Where-Object { $_.BackendAddressPool.Id -eq $pool.Id }) {
-                        $rule = $lb.LoadBalancingRules | Where-Object { $_.BackendAddressPool.Id -eq $pool.Id } | Select-Object -First 1
-                        $ruleLabel += "`n$($rule.Protocol):$($rule.Port)"
-                    }
-
-                    $diagramEdges += @"
-                    <mxCell id="edge_lb_backend_$($nodeIdCounter)" value="$ruleLabel" style="edgeStyle=orthogonalEdgeStyle;endArrow=block;html=1;strokeColor=#1976D2;labelBackgroundColor=#BBDEFB;" parent="1" source="$lbId" target="$targetNicId" edge="1">
-                      <mxGeometry relative="1" as="geometry"/>
-                    </mxCell>
-"@
-                    $nodeIdCounter++
-                }
-            }
-
-            $allResources += [PSCustomObject]@{
-                Subscription = $sub.Name
-                SubscriptionId = $sub.Id
-                ResourceGroup = $lb.ResourceGroupName
-                Type = "LoadBalancer"
-                Name = $lbName
-                FrontendIP = $lbFrontendIp
-                BackendPools = ($lb.BackendAddressPools.Name -join ', ')
-                LoadBalancingRules = ($lb.LoadBalancingRules | ForEach-Object { "$($_.Protocol):$($_.Port)" } -join ', ')
-            }
-
-            # Also record the Frontend Public IP if it exists
-            if ($lbFrontendIpConfig.PublicIPAddress) {
-                $lbPip = $lbFrontendIpConfig.PublicIPAddress
-                $lbPipId = "pip_$($lbPip.Id -replace '[^a-zA-Z0-9]', '_')"
-                if (-not $recordedPublicIpIds.ContainsKey($lbPipId)) {
-                    $isAttached = $true  # attached to LB
-                    $allResources += [PSCustomObject]@{
-                        Subscription = $sub.Name
+                    $resources.Add([PSCustomObject]@{
+                        Subscription   = $sub.Name
                         SubscriptionId = $sub.Id
-                        ResourceGroup = $lbPip.ResourceGroupName
-                        Type = "PublicIP"
-                        Name = $lbPip.Name
-                        IPAddress = $lbPip.IpAddress
-                        AssociatedWith = "LB: $lbName"
-                        Orphaned = $false
+                        ResourceGroup  = $nic.ResourceGroupName
+                        Type           = "PublicIP"
+                        Name           = $pipName
+                        VNet           = $vnetName
+                        IPRange        = ''
+                        PrivateIP      = ''
+                        PublicIP       = $pipAddress
+                        NSG            = ''
+                        AssociatedWith = $nicName
+                    })
+                    $recordedPips.TryAdd($pipId, $true) | Out-Null
+                }
+
+                $resources.Add([PSCustomObject]@{
+                    Subscription   = $sub.Name
+                    SubscriptionId = $sub.Id
+                    ResourceGroup  = $nic.ResourceGroupName
+                    Type           = "NetworkInterface"
+                    Name           = $nicName
+                    VNet           = $vnetName
+                    IPRange        = ''
+                    PrivateIP      = $privateIp
+                    PublicIP       = ''
+                    NSG            = if ($nic.NetworkSecurityGroup) { $nic.NetworkSecurityGroup.Id -replace '.*/' } else { '' }
+                    AssociatedWith = $nicSubnetName
+                })
+            }
+
+            # Process Load Balancers
+            foreach ($lb in $loadBalancers) {
+                $lbFrontendIpConfig = $lb.FrontendIpConfigurations | Where-Object { 
+                    $_.Subnet -and ($_.Subnet.Id -like "$($vnet.Id)/subnets/*")
+                }
+                if (-not $lbFrontendIpConfig) { continue }
+
+                $lbName = $lb.Name
+                $lbPrivateIp = if ($lbFrontendIpConfig.PrivateIPAddress) { $lbFrontendIpConfig.PrivateIPAddress } else { '' }
+                $lbPublicIp = ''
+                
+                if ($lbFrontendIpConfig.PublicIPAddress -and $publicIpsById.ContainsKey($lbFrontendIpConfig.PublicIPAddress.Id)) {
+                    $lbPublicIp = $publicIpsById[$lbFrontendIpConfig.PublicIPAddress.Id].IpAddress
+                }
+
+                $resources.Add([PSCustomObject]@{
+                    Subscription   = $sub.Name
+                    SubscriptionId = $sub.Id
+                    ResourceGroup  = $lb.ResourceGroupName
+                    Type           = "LoadBalancer"
+                    Name           = $lbName
+                    VNet           = $vnetName
+                    IPRange        = ''
+                    PrivateIP      = $lbPrivateIp
+                    PublicIP       = $lbPublicIp
+                    NSG            = ''
+                    AssociatedWith = "Backend: $($lb.BackendAddressPools.Name -join ', ')"
+                })
+
+                # Record Frontend Public IP
+                if ($lbFrontendIpConfig.PublicIPAddress) {
+                    $lbPipId = "pip_$($lbFrontendIpConfig.PublicIPAddress.Id -replace '[^a-zA-Z0-9]', '_')"
+                    if ($recordedPips.TryAdd($lbPipId, $true)) {
+                        $lbPipObj = $publicIpsById[$lbFrontendIpConfig.PublicIPAddress.Id]
+                        if ($lbPipObj) {
+                            $resources.Add([PSCustomObject]@{
+                                Subscription   = $sub.Name
+                                SubscriptionId = $sub.Id
+                                ResourceGroup  = $lbPipObj.ResourceGroupName
+                                Type           = "PublicIP"
+                                Name           = $lbPipObj.Name
+                                VNet           = $vnetName
+                                IPRange        = ''
+                                PrivateIP      = ''
+                                PublicIP       = $lbPipObj.IpAddress
+                                NSG            = ''
+                                AssociatedWith = "LB: $lbName"
+                            })
+                        }
                     }
-                    $recordedPublicIpIds[$lbPipId] = $true
+                }
+            }
+
+            # Process Application Gateways
+            foreach ($appGw in $appGateways) {
+                $appGwFrontendIpConfig = $appGw.FrontendIPConfigurations | Where-Object { 
+                    $_.Subnet -and ($_.Subnet.Id -like "$($vnet.Id)/subnets/*")
+                }
+                if (-not $appGwFrontendIpConfig) { continue }
+
+                $appGwName = $appGw.Name
+                $appGwPrivateIp = if ($appGwFrontendIpConfig.PrivateIPAddress) { $appGwFrontendIpConfig.PrivateIPAddress } else { '' }
+                $appGwPublicIp = ''
+                
+                if ($appGwFrontendIpConfig.PublicIPAddress -and $publicIpsById.ContainsKey($appGwFrontendIpConfig.PublicIPAddress.Id)) {
+                    $appGwPublicIp = $publicIpsById[$appGwFrontendIpConfig.PublicIPAddress.Id].IpAddress
+                }
+
+                $resources.Add([PSCustomObject]@{
+                    Subscription   = $sub.Name
+                    SubscriptionId = $sub.Id
+                    ResourceGroup  = $appGw.ResourceGroupName
+                    Type           = "ApplicationGateway"
+                    Name           = $appGwName
+                    VNet           = $vnetName
+                    IPRange        = ''
+                    PrivateIP      = $appGwPrivateIp
+                    PublicIP       = $appGwPublicIp
+                    NSG            = ''
+                    AssociatedWith = "Backend: $($appGw.BackendAddressPools.Name -join ', ')"
+                })
+
+                # Record Frontend Public IP
+                if ($appGwFrontendIpConfig.PublicIPAddress) {
+                    $agwPipId = "pip_$($appGwFrontendIpConfig.PublicIPAddress.Id -replace '[^a-zA-Z0-9]', '_')"
+                    if ($recordedPips.TryAdd($agwPipId, $true)) {
+                        $agwPipObj = $publicIpsById[$appGwFrontendIpConfig.PublicIPAddress.Id]
+                        if ($agwPipObj) {
+                            $resources.Add([PSCustomObject]@{
+                                Subscription   = $sub.Name
+                                SubscriptionId = $sub.Id
+                                ResourceGroup  = $agwPipObj.ResourceGroupName
+                                Type           = "PublicIP"
+                                Name           = $agwPipObj.Name
+                                VNet           = $vnetName
+                                IPRange        = ''
+                                PrivateIP      = ''
+                                PublicIP       = $agwPipObj.IpAddress
+                                NSG            = ''
+                                AssociatedWith = "AppGw: $appGwName"
+                            })
+                        }
+                    }
                 }
             }
         }
 
-        # Process Application Gateways that have frontend in this VNet
-        foreach ($appGw in $appGateways) {
-            $appGwFrontendIpConfig = $appGw.FrontendIPConfigurations | Where-Object { $_.Subnet -and $_.Subnet.Id -eq $vnet.Id }
-            if (-not $appGwFrontendIpConfig) { continue }
+        # Detect orphaned Public IPs within this subscription (no extra API call needed!)
+        foreach ($pip in $allPublicIps) {
+            $pipId = "pip_$($pip.Id -replace '[^a-zA-Z0-9]', '_')"
+            if (-not $recordedPips.TryAdd($pipId, $true)) { continue }  # Already recorded
 
-            $appGwId = "agw_$($appGw.Id -replace '[^a-zA-Z0-9]', '_')"
-            $appGwName = $appGw.Name
-            $frontendIp = $appGwFrontendIpConfig.PublicIPAddress?.IpAddress ??
-                          ($appGwFrontendIpConfig.PrivateIPAddress ? "Private: $($appGwFrontendIpConfig.PrivateIPAddress)" : "No IP")
+            $isAttached = $false
+            if ($pip.IpConfiguration) { $isAttached = $true }
+            elseif ($pip.LoadBalancer) { $isAttached = $true }
+            elseif ($pip.ApplicationGateway) { $isAttached = $true }
 
-            # Create App Gateway node
-            $diagramNodes += @"
-            <mxCell id="$appGwId" value="AppGw`n$appGwName`n$frontendIp" style="shape=umlLollipop;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#000000;" vertex="1" parent="1">
-              <mxGeometry x="$(($nodeIdCounter % 10) * 100 + 50)" y="$(([math]::Floor($nodeIdCounter / 10) * 100) + 200)" width="140" height="60" as="geometry"/>
-            </mxCell>
-"@
-            $nodeIdCounter++
-
-            # Edge from AppGw frontend to VNet
-            $edgeStyle = "edgeStyle=elbowEdgeStyle;endArrow=none;html=1;strokeColor=#9C27B0;"
-            $diagramEdges += @"
-            <mxCell id="edge_agw_vnet_$($nodeIdCounter)" value="Frontend" style="$edgeStyle" parent="1" source="$appGwId" target="$vnetId" edge="1">
-              <mxGeometry relative="1" as="geometry"/>
-            </mxCell>
-"@
-            $nodeIdCounter++
-
-            # Backend pools: connect AppGw to NICs
-            foreach ($pool in $appGw.BackendAddressPools) {
-                foreach ($nicRef in $pool.BackendIPConfigurations) {
-                    $targetNic = $nics | Where-Object { $_.Id -eq $nicRef.Id }
-                    if (-not $targetNic) { continue }
-
-                    $targetNicId = "nic_$($targetNic.Id -replace '[^a-zA-Z0-9]', '_')"
-                    $ruleLabel = "Backend: $($pool.Name)"
-                    # Try to find associated HTTP setting and listener for this pool
-                    $relatedRule = $appGw.HttpListeners | Where-Object { $_.DefaultBackendAddressPool.Id -eq $pool.Id } | Select-Object -First 1
-                    if ($relatedRule) {
-                        $ruleLabel += "`n$($relatedRule.Protocol):$($relatedRule.Port)"
-                    }
-
-                    $diagramEdges += @"
-                    <mxCell id="edge_agw_backend_$($nodeIdCounter)" value="$ruleLabel" style="edgeStyle=orthogonalEdgeStyle;endArrow=block;html=1;strokeColor=#7B1FA2;labelBackgroundColor=#E1BEE7;" parent="1" source="$appGwId" target="$targetNicId" edge="1">
-                      <mxGeometry relative="1" as="geometry"/>
-                    </mxCell>
-"@
-                    $nodeIdCounter++
-                }
+            $orphanStatus = -not $isAttached
+            if ($orphanStatus) {
+                $orphanPips.Add($pip)
             }
 
-            $allResources += [PSCustomObject]@{
-                Subscription = $sub.Name
+            $resources.Add([PSCustomObject]@{
+                Subscription   = $sub.Name
                 SubscriptionId = $sub.Id
-                ResourceGroup = $appGw.ResourceGroupName
-                Type = "ApplicationGateway"
-                Name = $appGwName
-                FrontendIP = $frontendIp
-                BackendPools = ($appGw.BackendAddressPools.Name -join ', ')
-                HttpListeners = ($appGw.HttpListeners | ForEach-Object { "$($_.Protocol):$($_.Port)" } -join ', ')
-                Sku = $appGw.Sku.Name
-            }
-
-            # Also record the Frontend Public IP if it exists (for orphan detection and CSV)
-            if ($appGwFrontendIpConfig.PublicIPAddress) {
-                $agwPip = $appGwFrontendIpConfig.PublicIPAddress
-                $agwPipId = "pip_$($agwPip.Id -replace '[^a-zA-Z0-9]', '_')"
-                if (-not $recordedPublicIpIds.ContainsKey($agwPipId)) {
-                    $allResources += [PSCustomObject]@{
-                        Subscription = $sub.Name
-                        SubscriptionId = $sub.Id
-                        ResourceGroup = $agwPip.ResourceGroupName
-                        Type = "PublicIP"
-                        Name = $agwPip.Name
-                        IPAddress = $agwPip.IpAddress
-                        AssociatedWith = "AppGw: $appGwName"
-                        Orphaned = $false
-                    }
-                    $recordedPublicIpIds[$agwPipId] = $true
-                }
-            }
+                ResourceGroup  = $pip.ResourceGroupName
+                Type           = "PublicIP"
+                Name           = $pip.Name
+                VNet           = ''
+                IPRange        = ''
+                PrivateIP      = ''
+                PublicIP       = $pip.IpAddress
+                NSG            = ''
+                AssociatedWith = if ($isAttached) { 'LoadBalancer/AppGateway' } else { if ($orphanStatus) { 'ORPHANED' } else { '' } }
+            })
         }
 
-        # Also handle Public IPs that might be attached to Load Balancers or Application Gateways (briefly)
-        # We'll do orphan detection globally after processing all subscriptions
+        Write-Host "  [$($sub.Name)] Done - $($vnets.Count) VNets, $($allNics.Count) NICs, $($allPublicIps.Count) PIPs" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "  [$($sub.Name)] Error: $_" -ForegroundColor Red
     }
 }
 
-# Close Draw.IO XML
-# Detect orphaned Public IPs (unused) across all subscriptions
-Write-Host "`nDetecting orphaned public IPs..." -ForegroundColor Cyan
-foreach ($sub in $subscriptions) {
-    Set-AzContext -SubscriptionId $sub.Id | Out-Null
-    $allPips = Get-AzPublicIpAddress -ErrorAction SilentlyContinue
-    foreach ($pip in $allPips) {
-        $pipId = $pip.Id
-        if ($recordedPublicIpIds.ContainsKey($pipId)) { continue }
+$stopwatch.Stop()
 
-        $isAttached = $false
-        if ($pip.IpConfiguration) { $isAttached = $true }
-        elseif ($pip.LoadBalancer) { $isAttached = $true }
-        elseif ($pip.ApplicationGateway) { $isAttached = $true }
-
-        $orphanStatus = -not $isAttached
-        if ($orphanStatus) {
-            $orphanedPublicIPs += $pip
-        }
-
-        $allResources += [PSCustomObject]@{
-            Subscription = $sub.Name
-            SubscriptionId = $sub.Id
-            ResourceGroup = $pip.ResourceGroupName
-            Type = "PublicIP"
-            Name = $pip.Name
-            IPAddress = $pip.IpAddress
-            AssociatedWith = if ($isAttached) { 'LoadBalancer/AppGateway' } else { '' }
-            Orphaned = $orphanStatus
-        }
-    }
-}
+$stopwatch.Stop()
 
 # Summary of orphans
-if ($orphanedPublicIPs.Count -gt 0) {
-    Write-Host "Found $($orphanedPublicIPs.Count) orphaned public IP(s) (not attached to any resource)." -ForegroundColor Yellow
+$orphanCount = $orphanedPublicIPs.Count
+if ($orphanCount -gt 0) {
+    Write-Host "`nFound $orphanCount orphaned public IP(s) (not attached to any resource)." -ForegroundColor Yellow
 } else {
-    Write-Host "No orphaned public IPs found." -ForegroundColor Green
+    Write-Host "`nNo orphaned public IPs found." -ForegroundColor Green
 }
 
-$drawio += $diagramNodes -join "`n"
-$drawio += $diagramEdges -join "`n"
-$drawio += @"
-      </root>
-    </mxGraphModel>
-  </diagram>
-</mxfile>
-"@
+# Convert thread-safe collection to array for export
+$resourceList = @($allResources.ToArray())
 
-# Export outputs
+# Export CSV output
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $csvPath = "network-inventory-$timestamp.csv"
-$drawioPath = "network-topology-$timestamp.drawio"
 
-$allResources | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-$drawio | Out-File -FilePath $drawioPath -Encoding UTF8
+$resourceList | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
 Write-Host "`nExported:" -ForegroundColor Green
-Write-Host "  CSV:  $csvPath" -ForegroundColor Cyan
-Write-Host "  DrawIO: $drawioPath" -ForegroundColor Cyan
-Write-Host "`nImport the .drawio file into https://app.diagrams.net/ to view the topology." -ForegroundColor Yellow
+Write-Host "  CSV: $csvPath" -ForegroundColor Cyan
+Write-Host "`nTotal resources inventoried: $($resourceList.Count)" -ForegroundColor Green
+Write-Host "Completed in $([math]::Round($stopwatch.Elapsed.TotalSeconds, 1)) seconds" -ForegroundColor Cyan
